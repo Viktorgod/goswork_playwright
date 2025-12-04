@@ -16,8 +16,8 @@ ORBITA_LOGIN = os.getenv("ORBITA_LOGIN")
 ORBITA_PASSWORD = os.getenv("ORBITA_PASSWORD")
 PLAN_DAY = float(os.getenv("PLAN_DAY", "2000"))
 
-CHECK_INTERVAL = 10  # 1 час
-BASE_DIR = "/data"  # постоянное хранилище Railway
+CHECK_INTERVAL = 3600  # 1 hour
+BASE_DIR = "/data"
 HISTORY_FILE = os.path.join(BASE_DIR, "last.json")
 
 
@@ -30,6 +30,8 @@ def validate_env():
         chat_id_int = int(CHAT_ID_ENV)
     except ValueError:
         raise RuntimeError("CHAT_ID must be int")
+    if not ORBITA_LOGIN or not ORBITA_PASSWORD:
+        raise RuntimeError("ORBITA_LOGIN or ORBITA_PASSWORD missing")
     return chat_id_int
 
 
@@ -37,7 +39,6 @@ CHAT_ID = validate_env()
 
 
 def ensure_storage():
-    """Создаём /data если нет."""
     os.makedirs(BASE_DIR, exist_ok=True)
 
 
@@ -57,7 +58,6 @@ def load_last() -> dict:
 
 
 def backup_history():
-    """Бэкап last.json → last_YYYY-MM-DD.json"""
     if not os.path.exists(HISTORY_FILE):
         return
     today = datetime.now().strftime("%Y-%m-%d")
@@ -70,7 +70,6 @@ def backup_history():
 
 
 def reset_daily():
-    """Ежедневный сброс данных в 00:00"""
     save_last({})
     backup_history()
 
@@ -82,6 +81,10 @@ def create_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1600,900")
+
+    # 👇 Это ключевая строка для Railway
+    options.binary_location = "/usr/bin/chromium"
+
     return webdriver.Chrome(options=options)
 
 
@@ -109,7 +112,7 @@ def parse_balance_table(driver):
     table = driver.find_element(By.TAG_NAME, "table")
     today_col = find_today_column(table)
     if today_col is None:
-        return f"❌ Column for {today_str}.{month_str} not found", {}
+        return f"❌ Column for {today_str}.{month_str} not found", {}, 0
 
     rows = table.find_elements(By.TAG_NAME, "tr")
     pairs = []
@@ -120,6 +123,7 @@ def parse_balance_table(driver):
             continue
         name = ths[0].text.strip().replace("\n", " ")
         lname = name.lower()
+
         if (
             not name
             or "всего" in lname
@@ -131,31 +135,76 @@ def parse_balance_table(driver):
             continue
 
         tds = row.find_elements(By.TAG_NAME, "td")
-        if len(tds) <= today_col:
-            continue
+        value = tds[today_col].text.strip() if len(tds) > today_col else "0"
 
-        value = tds[today_col].text.strip() or "0"
         try:
             num_value = float(value.replace(",", "."))
-        except:
+        except Exception:
             num_value = 0.0
 
         pairs.append((name, num_value))
 
-    if not pairs:
-        return f"No data for {today_str}.{month_str}", {}
-
     pairs.sort(key=lambda x: x[1], reverse=True)
-    total = sum(val for _, val in pairs)
+    total = sum(v for _, v in pairs)
 
-    # Общее отображение
-    medals = ["🥇", "🥈", "🥉"]
     lines = [f"📊 Баланс за {today_str}.{month_str}\n"]
+    medals = ["🥇", "🥈", "🥉"]
+
     for i, (name, val) in enumerate(pairs):
         medal = medals[i] if i < 3 else "▫️"
         lines.append(f"{medal} {name:<20} — {val}")
 
+    lines.append(f"\n💰 Итого: {total}")
+
+    if PLAN_DAY > 0:
+        percent = round(total / PLAN_DAY * 100, 1)
+        left = round(PLAN_DAY - total, 2)
+        lines.append("\n🎯 План на день:")
+        lines.append(f"📌 План: {PLAN_DAY}")
+        lines.append(f"📊 Выполнено: {percent}%")
+        if left > 0:
+            lines.append(f"⏳ Осталось: {left}")
+        else:
+            lines.append("🏆 План выполнен!")
+
     return "\n".join(lines), dict(pairs), total
+
+
+def login_and_get_balance_text():
+    driver = create_driver()
+    wait = WebDriverWait(driver, 30)
+
+    try:
+        driver.get("https://orbita.life/login")
+
+        email_input = wait.until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email'], input[name='login']"))
+        )
+        password_input = driver.find_element(By.CSS_SELECTOR, "input[type='password'], input[name='password']")
+
+        email_input.clear()
+        email_input.send_keys(ORBITA_LOGIN)
+        password_input.clear()
+        password_input.send_keys(ORBITA_PASSWORD)
+
+        btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit'], button.btn-primary")
+        btn.click()
+
+        wait.until(lambda d: "login" not in d.current_url.lower())
+        driver.get("https://orbita.life")
+
+        return parse_balance_table(driver)
+    finally:
+        driver.quit()
+
+
+async def send_long(bot: Bot, chat_id: int, text: str):
+    if len(text) <= 4000:
+        await bot.send_message(chat_id, text)
+        return
+
+    for i in range(0, len(text), 4000):
+        await bot.send_message(chat_id, text[i:i + 4000])
 
 
 async def main():
@@ -167,15 +216,14 @@ async def main():
         while True:
             now = datetime.now()
 
-            # Сброс в 00:00
             if date.today() != last_date:
                 reset_daily()
                 last_date = date.today()
 
             try:
                 balance_text, current_values, total = login_and_get_balance_text()
-
                 last_values = load_last()
+
                 growth_lines = []
                 sum_growth = 0
 
@@ -183,6 +231,7 @@ async def main():
                     old = last_values.get(name, val)
                     diff = round(val - old, 2)
                     sum_growth += diff
+
                     if diff > 0:
                         growth_lines.append(f"📈 {name}: +{diff}")
                     elif diff < 0:
@@ -196,16 +245,22 @@ async def main():
                 full_text = (
                     f"⏰ Обновление ORBITA ({now_str})\n\n"
                     f"{balance_text}\n\n"
-                    "📊 Прирост за час:\n" + "\n".join(growth_lines) +
+                    "📊 Прирост за час:\n" +
+                    "\n".join(growth_lines) +
                     f"\n\n📈 Общий прирост за час: {sum_growth}"
                 )
 
-                await bot.send_message(CHAT_ID, full_text)
+                await send_long(bot, CHAT_ID, full_text)
 
             except Exception as e:
-                await bot.send_message(CHAT_ID, f"❌ Error:\n{e}")
+                await bot.send_message(CHAT_ID, f"❌ Ошибка:\n{e}")
 
             await asyncio.sleep(CHECK_INTERVAL)
 
     finally:
         await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
