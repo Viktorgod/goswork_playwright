@@ -81,11 +81,16 @@ def create_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1600,900")
+    options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--disable-software-rasterizer")
 
-    # 👇 Это ключевая строка для Railway
+    # Railway Chromium path
     options.binary_location = "/usr/bin/chromium"
 
-    return webdriver.Chrome(options=options)
+    return webdriver.Chrome(
+        options=options,
+        executable_path="/usr/bin/chromedriver"
+    )
 
 
 def find_today_column(table):
